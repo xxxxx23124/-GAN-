@@ -89,9 +89,10 @@ class Train(trainunits.Units):
                     ('r2_reg_f', r2_reg_f.item()),
                     ('g_loss', g_loss.item()),
                 ])'''
-                if i % 300 == 0:
+                if i % 20 == 0:
                     self.save_images("generated_images/", epoch, i)
-
+                    #self.save_ckpt('WGANGPR2', epoch, i)
+                
                 proc_bar.set_postfix(
                     {"epoch": f"{epoch}", "Loss_G": f"{g_loss.item():.4f}", "real_loss": f"{real_loss.item():.4f}",
                      "fake_loss": f"{fake_loss.item():.4f}", "gp": f"{gp.item():.4f}",
@@ -99,12 +100,11 @@ class Train(trainunits.Units):
                      "r2_reg_f": f"{r2_reg_f.item():.4f}"})
                 self.scheduler_G.step()
                 self.scheduler_D.step()
-
+                
                 proc_bar.update(1)
             # self.save_record('WGANGPR2', epoch + 1, 0)
             # self.save_ckpt('WGANGPR2', epoch + 1, 0)
             proc_bar.reset()
-            if epoch % 15 == 0:
-                self.save_ckpt('WGANGPR2', epoch, 0)
+            self.save_ckpt('WGANGPR2', epoch + 1, 0)
         proc_bar.close()
         self.save_ckpt('WGANGPR2', self.num_epochs, 0)
