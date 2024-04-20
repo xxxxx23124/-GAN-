@@ -28,5 +28,5 @@ def get_MNIST(dataroot):
 
 def get_dataloader(dataset, batch_size):
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size,
-                                             shuffle=True)
+                                             shuffle=True, drop_last=True)
     return dataloader
