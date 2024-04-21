@@ -4,18 +4,6 @@ import math
 from typing import Tuple, List
 import numpy as np
 
-'''
-参考论文：
-    （class Smooth，class UpSample_rgb，class EqualizedWeight，class EqualizedLinear，class MappingNetwork，
-    class Conv2dWeightModulate，class StyleConv， class ToRGB）是参考‘Analyzing and Improving the Image Quality of StyleGAN’
-    class SEBlock 是参考‘Squeeze-and-Excitation Networks’
-    class ResnetInit 是参考‘RESNET IN RESNET: GENERALIZING RESIDUAL ARCHITECTURES’
-    class SelfAttention 是参考‘Self-Attention Generative Adversarial Networks’
-    class BasicBlock 是参考‘Dual Path Networks’和‘RESNET IN RESNET: GENERALIZING RESIDUAL ARCHITECTURES’
-    class Tree 是参考‘Deep Layer Aggregation’
-'''
-
-
 class Smooth(nn.Module):
     def __init__(self):
         super().__init__()
@@ -72,11 +60,48 @@ class MappingNetwork(nn.Module):
         layers = []
         for i in range(n_layers):
             layers.append(EqualizedLinear(planes, planes))
-            layers.append(nn.PReLU(planes))
+            layers.append(nn.LeakyReLU(0.2, True))
         self.net = nn.Sequential(*layers)
 
     def forward(self, z: torch.Tensor):
         return self.net(z)
+
+
+class EqualizedConv2d(nn.Module):
+    def __init__(self, in_features: int, out_features: int, kernel_size: int, padding: int = 0, stride: int = 1):
+        super().__init__()
+        self.padding = padding
+        self.stride = stride
+        self.weight = EqualizedWeight([out_features, in_features, kernel_size, kernel_size])
+        self.bias = nn.Parameter(torch.nn.init.normal_(torch.empty(out_features), mean=0, std=1))
+
+    def forward(self, x: torch.Tensor):
+        x = nn.functional.pad(input=x, pad=(self.padding, self.padding, self.padding, self.padding), mode="replicate")
+        return nn.functional.conv2d(x, self.weight(), bias=self.bias, stride=self.stride)
+
+class SelfAttention(nn.Module):
+    def __init__(self, in_planes: int, embedding_channels: int):
+        super(SelfAttention, self).__init__()
+        self.key = EqualizedConv2d(in_planes, embedding_channels, 1)
+        self.query = EqualizedConv2d(in_planes, embedding_channels, 1)
+        self.value = EqualizedConv2d(in_planes, embedding_channels, 1)
+        self.self_att = EqualizedConv2d(embedding_channels, in_planes, 1)
+        self.gamma = nn.Parameter(torch.nn.init.uniform_(torch.empty(in_planes), a=0.2, b=0.3))
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, x: torch.Tensor):
+        B, C, H, W = x.size()
+        N = H * W
+        f_x = self.key(x).view(B, -1, N)
+        g_x = self.query(x).view(B, -1, N)
+        h_x = self.value(x).view(B, -1, N)
+        s = torch.bmm(f_x.permute(0, 2, 1), g_x)
+        beta = self.softmax(s)
+        v = torch.bmm(h_x, beta)
+        v = v.view(B, -1, H, W)
+        o = self.self_att(v)
+        y = self.gamma[None, :, None, None] * o + x
+        return y
 
 
 class Conv2dWeightModulate(nn.Module):
@@ -128,9 +153,9 @@ class StyleBlock(nn.Module):
                  kernel_size: int):
         super(StyleBlock, self).__init__()
         self.conv1 = StyleConv(d_latent, last_planes, in_planes, kernel_size=1)
-        self.activation1 = nn.PReLU(in_planes)
+        self.activation1 = nn.LeakyReLU(0.2, True)
         self.conv2 = StyleConv(d_latent, in_planes, in_planes, kernel_size=kernel_size)
-        self.activation2 = nn.PReLU(in_planes)
+        self.activation2 = nn.LeakyReLU(0.2, True)
         self.conv3 = StyleConv(d_latent, in_planes, out_planes + dense_depth, kernel_size=kernel_size)
 
     def forward(self, x: torch.Tensor, w: torch.Tensor):
@@ -146,7 +171,7 @@ class SEBlock(nn.Module):
     def __init__(self, d_latent: int, in_planes: int, out_planes: int, dense_depth: int):
         super(SEBlock, self).__init__()
         self.conv1 = StyleConv(d_latent, out_planes + dense_depth, in_planes, kernel_size=1)
-        self.activation1 = nn.PReLU(in_planes)
+        self.activation1 = nn.LeakyReLU(0.2, True)
         self.conv2 = StyleConv(d_latent, in_planes, out_planes + dense_depth, kernel_size=1)
         self.activation2 = nn.Sigmoid()
 
@@ -196,31 +221,6 @@ class ResnetInit(nn.Module):
         return x_residual, x_transient
 
 
-class SelfAttention(nn.Module):
-    def __init__(self, d_latent: int, in_planes: int, embedding_channels: int):
-        super(SelfAttention, self).__init__()
-        self.key = StyleConv(d_latent, in_planes, embedding_channels, 1)
-        self.query = StyleConv(d_latent, in_planes, embedding_channels, 1)
-        self.value = StyleConv(d_latent, in_planes, embedding_channels, 1)
-        self.self_att = StyleConv(d_latent, embedding_channels, in_planes, 1)
-        self.gamma = nn.Parameter(torch.nn.init.uniform_(torch.empty(in_planes), a=0.1, b=0.14))
-        self.softmax = nn.Softmax(dim=1)
-
-    def forward(self, x: torch.Tensor, w: torch.Tensor):
-        B, C, H, W = x.size()
-        N = H * W
-        f_x = self.key(x, w).view(B, -1, N)
-        g_x = self.query(x, w).view(B, -1, N)
-        h_x = self.value(x, w).view(B, -1, N)
-        s = torch.bmm(f_x.permute(0, 2, 1), g_x)
-        beta = self.softmax(s)
-        v = torch.bmm(h_x, beta)
-        v = v.view(B, -1, H, W)
-        o = self.self_att(v, w)
-        y = self.gamma[None, :, None, None] * o + x
-        return y
-
-
 class ToRGB(nn.Module):
     def __init__(self, d_latent: int, planes: int):
         super().__init__()
@@ -228,35 +228,16 @@ class ToRGB(nn.Module):
             MappingNetwork(d_latent, 2),
             EqualizedLinear(d_latent, planes)
         )
-        self.attention = SelfAttention(d_latent, planes, planes)
+        self.attention = SelfAttention(planes, planes)
         self.conv = Conv2dWeightModulate(planes, 3, kernel_size=1, demodulate=False)
         self.bias = nn.Parameter(torch.nn.init.normal_(torch.empty(3), mean=0, std=1))
-        self.activation = nn.PReLU(3)
+        self.activation = nn.LeakyReLU(0.2, True)
 
     def forward(self, x: torch.Tensor, w: torch.Tensor):
+        x = self.attention(x)
         s = self.to_style(w)
-        x = self.attention(x, w)
         x = self.conv(x, s)
         return self.activation(x + self.bias[None, :, None, None])
-
-
-class UpSample(nn.Module):
-    def __init__(self, d_latent: int, planes: int, out_planes: int, kernel_size: int, stride: int, padding: int,
-                 use_attention: bool = True):
-        super(UpSample, self).__init__()
-        if use_attention:
-            self.attention = SelfAttention(d_latent, planes, planes)
-        self.use_attention = use_attention
-        self.convT = nn.ConvTranspose2d(planes, out_planes, kernel_size=kernel_size, stride=stride, padding=padding)
-        self.activation = nn.PReLU()
-
-    def forward(self, x: torch.Tensor, w: torch.Tensor):
-        if self.use_attention:
-            x = self.attention(x, w)
-        x = self.convT(x)
-        x = self.activation(x)
-        return x
-
 
 class BasicBlock(nn.Module):
 
@@ -277,19 +258,17 @@ class BasicBlock(nn.Module):
         self.out_planes = out_planes
         self.dense_depth = dense_depth
         self.scale = nn.Parameter(torch.nn.init.uniform_(torch.empty(out_planes), a=0.1, b=0.3))
-        self.activation_res = nn.PReLU(out_planes)
-        self.activation_dense = nn.PReLU(dense_depth)
-        self.activation_transient = nn.PReLU(out_planes)
+        self.activation = nn.LeakyReLU(0.2, True)
 
         self.is_unify = is_unify
         self.root = root
 
         if is_unify:
             self.unify = StyleConv(d_latent, last_planes, 2 * out_planes + dense_depth, kernel_size=1)
-            self.attention = SelfAttention(d_latent, 2 * out_planes + dense_depth, 2 * out_planes + dense_depth)
+            self.attention = SelfAttention(2 * out_planes + dense_depth, 2 * out_planes + dense_depth)
             self.rir_3 = ResnetInit(d_latent, out_planes + dense_depth, in_planes, out_planes, dense_depth, 3)
         else:
-            self.attention = SelfAttention(d_latent, last_planes, last_planes)
+            self.attention = SelfAttention(last_planes, last_planes)
             self.rir_3 = ResnetInit(d_latent, last_planes - out_planes, in_planes, out_planes, dense_depth, 3)
 
         if root:
@@ -299,17 +278,17 @@ class BasicBlock(nn.Module):
         d = self.out_planes
         if self.is_unify:
             x = self.unify(x, w)
-        x_attention = self.attention(x, w)
+        x_attention = self.attention(x)
         x_residual = torch.cat([x_attention[:, :d, :, :], x_attention[:, 2 * d:, :, :]], 1)
         x_transient = x_attention[:, d:, :, :]
         x_residual_3, x_transient_3 = self.rir_3((x_residual, x_transient), w)
 
         if self.root:
             x = self.shortcut(x, w)
-        res = self.activation_res(x[:, :d, :, :] + x_residual_3[:, :d, :, :] * self.scale[None, :, None, None])
-        x_transient_3 = self.activation_transient(x_transient_3)
-        dense = self.activation_dense(x_residual_3[:, d:, :, :])
+        res = x[:, :d, :, :] + x_residual_3[:, :d, :, :] * self.scale[None, :, None, None]
+        dense = x_residual_3[:, d:, :, :]
         out = torch.cat([res, x_transient_3, x[:, 2 * d:, :, :], dense], 1)
+        out = self.activation(out)
         return out
 
 
@@ -361,10 +340,10 @@ class Tree(nn.Module):
             self.root_last_planes += sub_block.get_out_planes()
             self.root = BasicBlock(d_latent, self.root_last_planes, in_planes * block_num, out_planes, dense_depth,
                                    True, False)
+            self.mix_rgb = ToRGB(d_latent, 6)
+            self.scale_old_mix = nn.Parameter(torch.nn.init.uniform_(torch.empty(3), a=0.4, b=0.6))
+            self.scale_new_mix = nn.Parameter(torch.nn.init.uniform_(torch.empty(3), a=0.4, b=0.6))
         self.to_rgb = ToRGB(d_latent, self.get_out_planes())
-        self.mix_rgb = ToRGB(d_latent, 6)
-        self.scale_old_mix = nn.Parameter(torch.nn.init.uniform_(torch.empty(3), a=0.4, b=0.6))
-        self.scale_new_mix = nn.Parameter(torch.nn.init.uniform_(torch.empty(3), a=0.4, b=0.6))
         self.scale_old = nn.Parameter(torch.nn.init.uniform_(torch.empty(3), a=0.4, b=0.6))
         self.scale_new = nn.Parameter(torch.nn.init.uniform_(torch.empty(3), a=0.4, b=0.6))
 
@@ -388,6 +367,24 @@ class Tree(nn.Module):
         rgb = rgb * self.scale_old[None, :, None, None] + rgb_new * self.scale_new[None, :, None, None]
         return out, rgb
 
+class UpSample(nn.Module):
+    def __init__(self, planes: int, out_planes: int, kernel_size: int, stride: int, padding: int,
+                 use_attention: bool = True):
+        super(UpSample, self).__init__()
+        if use_attention:
+            self.attention = SelfAttention(planes, planes)
+        self.use_attention = use_attention
+        self.convT = nn.ConvTranspose2d(planes, out_planes, kernel_size=kernel_size, stride=stride, padding=padding)
+        self.activation = nn.LeakyReLU(0.2, True)
+        self.smooth = Smooth()
+
+    def forward(self, x: torch.Tensor):
+        if self.use_attention:
+            x = self.attention(x)
+        x = self.convT(x)
+        x = self.activation(x)
+        return self.smooth(x)
+
 class GeneratorBlock(nn.Module):
     def get_out_planes(self):
         return self.tree.get_out_planes()
@@ -396,7 +393,7 @@ class GeneratorBlock(nn.Module):
                  block_num: int, use_attention: bool = True, kernel_size: int = 4, stride: int = 2, padding: int = 1):
         super(GeneratorBlock, self).__init__()
 
-        self.upsample = UpSample(d_latent, planes=last_planes, out_planes=last_planes,
+        self.upsample = UpSample(planes=last_planes, out_planes=last_planes,
                                  kernel_size=kernel_size, stride=stride, padding=padding, use_attention=use_attention)
         self.tree = Tree(d_latent, last_planes, in_planes, out_planes, dense_depth, level, block_num)
         self.scale_old = nn.Parameter(torch.nn.init.uniform_(torch.empty(3), a=0.4, b=0.6))
@@ -405,40 +402,40 @@ class GeneratorBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, w: torch.Tensor, rgb: torch.Tensor):
         rgb = self.upsample_rgb(rgb)
-        x = self.upsample(x, w)
+        x = self.upsample(x)
         x, rgb_new = self.tree(x, w, rgb)
         rgb = rgb * self.scale_old[None, :, None, None] + rgb_new * self.scale_new[None, :, None, None]
         return x, rgb
 
 
 class Generator(nn.Module):
-    def __init__(self, z_dim, planes=32):
+    def __init__(self, z_dim, planes=64):
         super(Generator, self).__init__()
         self.mapping_network = MappingNetwork(z_dim, 8)
-        self.upsample1 = UpSample(z_dim, planes=z_dim, out_planes=planes * 16, kernel_size=4, stride=1, padding=0,
+        self.upsample1 = UpSample(planes=z_dim, out_planes=planes * 8, kernel_size=4, stride=1, padding=0,
                                   use_attention=False)
-        self.initial_constant = nn.Parameter(torch.nn.init.normal_(torch.empty((1, planes * 16, 4, 4)), mean=0, std=1))
-        self.scale_old = nn.Parameter(torch.nn.init.uniform_(torch.empty(planes * 16), a=0.4, b=0.6))
-        self.scale_new = nn.Parameter(torch.nn.init.uniform_(torch.empty(planes * 16), a=0.4, b=0.6))
-        self.style1 = SEStyleBlock(z_dim, planes * 16, planes * 8, planes * 16, 0, 3)
-        self.activation1 = nn.PReLU(planes * 16)
-        self.to_rgb1 = ToRGB(z_dim, planes * 16)
-        self.tree = Tree(z_dim, planes * 16, planes * 4, planes * 8,
-                         planes // 16, 3, 3)
+        self.initial_constant = nn.Parameter(torch.nn.init.normal_(torch.empty((1, planes * 8, 4, 4)), mean=0, std=1))
+        self.scale_old = nn.Parameter(torch.nn.init.uniform_(torch.empty(planes * 8), a=0.4, b=0.6))
+        self.scale_new = nn.Parameter(torch.nn.init.uniform_(torch.empty(planes * 8), a=0.4, b=0.6))
+        self.style1 = SEStyleBlock(z_dim, planes * 8, planes * 4, planes * 8, 0, 3)
+        self.activation1 = nn.LeakyReLU(0.2, True)
+        self.to_rgb1 = ToRGB(z_dim, planes * 8)
+        self.tree = Tree(z_dim, planes * 8, planes * 4, planes * 4,
+                         planes // 16, 2, 2)
 
-        self.block1 = GeneratorBlock(z_dim, self.tree.get_out_planes(), planes * 2, planes * 4,
-                                     planes // 8, 3, 3)  # 8
-        self.block2 = GeneratorBlock(z_dim, self.block1.get_out_planes(), planes * 1, planes * 2,
-                                     planes // 8, 3, 3)  # 16
-        self.block3 = GeneratorBlock(z_dim, self.block2.get_out_planes(), planes * 1, planes * 1,
-                                     planes // 8, 2, 4)  # 32
+        self.block1 = GeneratorBlock(z_dim, self.tree.get_out_planes(), planes * 4, planes * 4,
+                                     planes // 8, 2, 2)  # 8
+        self.block2 = GeneratorBlock(z_dim, self.block1.get_out_planes(), planes * 2, planes * 2,
+                                     planes // 8, 2, 2)  # 16
+        self.block3 = GeneratorBlock(z_dim, self.block2.get_out_planes(), planes * 2, planes * 2,
+                                     planes // 8, 2, 3)  # 32
         self.block4 = GeneratorBlock(z_dim, self.block3.get_out_planes(), planes * 1, planes * 1,
                                      planes // 8, 2, 4)  # 64
 
     def forward(self, x: torch.Tensor):
         w = self.mapping_network(torch.squeeze(x))
         g = self.initial_constant.expand(x.shape[0], -1, -1, -1)
-        x = self.upsample1(x, w)
+        x = self.upsample1(x)
         x = self.style1(x * self.scale_new[None, :, None, None] + g * self.scale_old[None, :, None, None], w)
         x = self.activation1(x)
         rgb = self.to_rgb1(x, w)
@@ -461,11 +458,11 @@ def test():
     summary(net, input_size=(4, 256, 1, 1))
     from torchviz import make_dot
 
-    #x = torch.randn(4, 256, 1, 1)
-    #y = net(x)
+    x = torch.randn(4, 256, 1, 1)
+    y = net(x)
     #dot = make_dot(y, params=dict(net.named_parameters()))
     # dot.view()
     #dot.render("G13_model_graph")
-    #print(y.size())
+    print(y.size())
     # print(net.get_out_planes())
     #print("successed")
