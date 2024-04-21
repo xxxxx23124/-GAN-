@@ -28,8 +28,7 @@ class EqualizedLinear(nn.Module):
 
 
 class EqualizedConv2d(nn.Module):
-    def __init__(self, in_features: int, out_features: int,
-                 kernel_size: int, padding: int = 0, stride: int = 1):
+    def __init__(self, in_features: int, out_features: int, kernel_size: int, padding: int = 0, stride: int = 1):
         super().__init__()
         self.padding = padding
         self.stride = stride
@@ -37,7 +36,32 @@ class EqualizedConv2d(nn.Module):
         self.bias = nn.Parameter(torch.nn.init.normal_(torch.empty(out_features), mean=0, std=1))
 
     def forward(self, x: torch.Tensor):
-        return nn.functional.conv2d(x, self.weight(), bias=self.bias, padding=self.padding, stride=self.stride)
+        x = nn.functional.pad(input=x, pad=(self.padding, self.padding, self.padding, self.padding), mode="replicate")
+        return nn.functional.conv2d(x, self.weight(), bias=self.bias, stride=self.stride)
+
+class SelfAttention(nn.Module):
+    def __init__(self, in_planes: int, embedding_channels: int):
+        super(SelfAttention, self).__init__()
+        self.key = EqualizedConv2d(in_planes, embedding_channels, 1)
+        self.query = EqualizedConv2d(in_planes, embedding_channels, 1)
+        self.value = EqualizedConv2d(in_planes, embedding_channels, 1)
+        self.self_att = EqualizedConv2d(embedding_channels, in_planes, 1)
+        self.gamma = nn.Parameter(torch.nn.init.uniform_(torch.empty(in_planes), a=0.2, b=0.3))
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, x: torch.Tensor):
+        B, C, H, W = x.size()
+        N = H * W
+        f_x = self.key(x).view(B, -1, N)
+        g_x = self.query(x).view(B, -1, N)
+        h_x = self.value(x).view(B, -1, N)
+        s = torch.bmm(f_x.permute(0, 2, 1), g_x)
+        beta = self.softmax(s)
+        v = torch.bmm(h_x, beta)
+        v = v.view(B, -1, H, W)
+        o = self.self_att(v)
+        y = self.gamma[None, :, None, None] * o + x
+        return y
 
 class MiniBatchStdDev(nn.Module):
     def __init__(self, group_size: int = 4):
@@ -81,23 +105,23 @@ class DownSample(nn.Module):
         return nn.functional.interpolate(x, (x.shape[2] // 2, x.shape[3] // 2), mode='bicubic', align_corners=False)
 
 class DiscriminatorBlock(nn.Module):
-    def __init__(self, in_features, out_features):
+    def __init__(self, in_features, out_features, downsample):
         super().__init__()
-        self.residual = nn.Sequential(DownSample(),
-                                      EqualizedConv2d(in_features, out_features, kernel_size=1))
+        self.residual = nn.Sequential()
+        self.down_sample = nn.Sequential()
+        if downsample:
+            self.residual = nn.Sequential(DownSample(),
+                                          EqualizedConv2d(in_features, out_features, kernel_size=1))
+            self.down_sample = nn.Sequential(
+                EqualizedConv2d(out_features, out_features, kernel_size=3, padding=1, stride=2),
+                nn.LeakyReLU(0.2, True),
+                Smooth()
+            )
         self.block = nn.Sequential(
             EqualizedConv2d(in_features, in_features, kernel_size=3, padding=1),
-            nn.PReLU(in_features),
-            EqualizedConv2d(in_features, in_features, kernel_size=3, padding=1),
-            nn.PReLU(in_features),
-            EqualizedConv2d(in_features, in_features, kernel_size=3, padding=1),
-            nn.PReLU(in_features),
+            nn.LeakyReLU(0.2, True),
             EqualizedConv2d(in_features, out_features, kernel_size=3, padding=1),
-            nn.PReLU(out_features),
-        )
-        self.down_sample = nn.Sequential(
-            EqualizedConv2d(out_features, out_features, kernel_size=3, padding=1, stride=2),
-            nn.PReLU(out_features),
+            nn.LeakyReLU(0.2, True),
         )
         self.scale = 1 / math.sqrt(2)
 
@@ -113,22 +137,33 @@ class Discriminator(nn.Module):
         features = 64
 
         self.conv = nn.Sequential(
-            EqualizedConv2d(3, features, 1),  # 64
-            nn.PReLU(features),
-            DiscriminatorBlock(features, 2 * features),  # 32
-            DiscriminatorBlock(2 * features, 4 * features),  # 16
-            DiscriminatorBlock(4 * features, 8 * features),  # 8
-            DiscriminatorBlock(8 * features, 16 * features),  # 4
+            EqualizedConv2d(3, features, 3, 1),  # 64
+            nn.LeakyReLU(0.2, True),
+            SelfAttention(features, features//8),
+            DiscriminatorBlock(features, features, False),
+            DiscriminatorBlock(features, features, False),
+            DiscriminatorBlock(features, 2 * features, True),  # 32
+            SelfAttention(2 * features, features // 4),
+            DiscriminatorBlock(2 * features, 2 * features, False),
+            DiscriminatorBlock(2 * features, 2 * features, False),
+            DiscriminatorBlock(2 * features, 4 * features, True),  # 16
+            SelfAttention(4 * features, features // 2),
+            DiscriminatorBlock(4 * features, 4 * features, False),
+            DiscriminatorBlock(4 * features, 4 * features, False),
+            DiscriminatorBlock(4 * features, 8 * features, True),  # 8
+            SelfAttention(8 * features, features),
+            DiscriminatorBlock(8 * features, 8 * features, False),
+            DiscriminatorBlock(8 * features, 8 * features, False),
+            DiscriminatorBlock(8 * features, 16 * features, True),  # 4
+            SelfAttention(16 * features, features * 2),
             MiniBatchStdDev(),
-            DiscriminatorBlock(16 * features + 1, 16 * features + 1),  # 2
+            DiscriminatorBlock(16 * features + 1, 16 * features + 1, False),
+            DiscriminatorBlock(16 * features + 1, 16 * features + 1, False),
+            DiscriminatorBlock(16 * features + 1, 16 * features + 1, True),  # 2
         )
         self.fc = nn.Sequential(
             EqualizedLinear(2 * 2 * (16 * features + 1), 2 * 2 * (16 * features + 1)),
-            nn.PReLU(2 * 2 * (16 * features + 1)),
-            EqualizedLinear(2 * 2 * (16 * features + 1), 2 * 2 * (16 * features + 1)),
-            nn.PReLU(2 * 2 * (16 * features + 1)),
-            EqualizedLinear(2 * 2 * (16 * features + 1), 2 * 2 * (16 * features + 1)),
-            nn.PReLU(2 * 2 * (16 * features + 1)),
+            nn.LeakyReLU(0.2, True),
             EqualizedLinear(2 * 2 * (16 * features + 1), 1),
         )
 
