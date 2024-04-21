@@ -15,9 +15,9 @@ class Units():
         self.fixed_noise = fixed_noise
         self.discriminator = discriminator
         self.discriminator_name = discriminator_name
-        self.optimizer_G = torch.optim.AdamW(generator.parameters(), lr=0.0001, betas=(0.5, 0.999))
+        self.optimizer_G = torch.optim.Adam(generator.parameters(), lr=0.0001)
         self.scheduler_G = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer_G, T_max=epoch_len)
-        self.optimizer_D = torch.optim.AdamW(discriminator.parameters(), lr=0.0004, betas=(0.5, 0.999))
+        self.optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=0.0004)
         self.scheduler_D = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer_D, T_max=epoch_len)
         plt.ion()
         self.show_model()
