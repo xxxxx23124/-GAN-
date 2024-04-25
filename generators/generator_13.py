@@ -24,50 +24,6 @@ class Smooth(nn.Module):
         return x.view(b, c, h, w)
 
 
-class SKConvT(nn.Module):
-    def __init__(self, planes: int):
-        super(SKConvT, self).__init__()
-        self.convT = EqualizedConvTranspose2D(planes, planes, kernel_size=4, stride=2, padding=1)
-        self.activation_convT = nn.PReLU(planes)
-
-        self.up_sample = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=False)
-        self.smooth = Smooth()
-
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        self.fc_main = MappingNetwork(planes, 4)
-
-        self.fc_convT = nn.Sequential(
-            MappingNetwork(planes, 2),
-            EqualizedLinear(planes, planes)
-        )
-
-        self.fc_bic = nn.Sequential(
-            MappingNetwork(planes, 2),
-            EqualizedLinear(planes, planes)
-        )
-
-        self.softmax = nn.Softmax(dim=1)
-
-    def forward(self, x: torch.Tensor):
-        fea_convT = self.activation_convT(self.convT(x)).unsqueeze_(dim=1)
-        fea_bic = self.smooth(self.up_sample(x)).unsqueeze_(dim=1)
-        feas = torch.cat([fea_convT, fea_bic], dim=1)
-
-        b, s, c, _, _ = feas.shape
-        fea_u = torch.sum(feas, dim=1)
-        fea_s = self.gap(fea_u).view(b, c)
-        fea_z = self.fc_main(fea_s)
-
-        fc_cpnvT = self.fc_convT(fea_z).unsqueeze_(dim=1)
-        fc_bic = self.fc_bic(fea_z).unsqueeze_(dim=1)
-        attention_vectors = torch.cat([fc_cpnvT, fc_bic], dim=1)
-
-        attention_vectors = self.softmax(attention_vectors)
-        attention_vectors = attention_vectors.view(b, s, c, 1, 1)
-        fea_v = (feas * attention_vectors).sum(dim=1)
-        return fea_v
-
-
 class EqualizedWeight(nn.Module):
     def __init__(self, shape: List[int]):
         super(EqualizedWeight, self).__init__()
@@ -138,11 +94,56 @@ class MappingNetwork(nn.Module):
         return self.net(z)
 
 
+class SKConvT(nn.Module):
+    def __init__(self, planes: int):
+        super(SKConvT, self).__init__()
+        self.convT = EqualizedConvTranspose2D(planes, planes, kernel_size=4, stride=2, padding=1)
+        self.activation_convT = nn.PReLU(planes)
+
+        self.up_sample = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=False)
+        self.smooth = Smooth()
+
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.fc_main = MappingNetwork(planes, 4)
+
+        self.fc_convT = nn.Sequential(
+            MappingNetwork(planes, 2),
+            EqualizedLinear(planes, planes)
+        )
+
+        self.fc_bic = nn.Sequential(
+            MappingNetwork(planes, 2),
+            EqualizedLinear(planes, planes)
+        )
+
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, x: torch.Tensor):
+        fea_convT = self.activation_convT(self.convT(x)).unsqueeze_(dim=1)
+        fea_bic = self.smooth(self.up_sample(x)).unsqueeze_(dim=1)
+        feas = torch.cat([fea_convT, fea_bic], dim=1)
+
+        b, s, c, _, _ = feas.shape
+        fea_u = torch.sum(feas, dim=1)
+        fea_s = self.gap(fea_u).view(b, c)
+        fea_z = self.fc_main(fea_s)
+
+        fc_cpnvT = self.fc_convT(fea_z).unsqueeze_(dim=1)
+        fc_bic = self.fc_bic(fea_z).unsqueeze_(dim=1)
+        attention_vectors = torch.cat([fc_cpnvT, fc_bic], dim=1)
+
+        attention_vectors = self.softmax(attention_vectors)
+        attention_vectors = attention_vectors.view(b, s, c, 1, 1)
+        fea_v = (feas * attention_vectors).sum(dim=1)
+        return fea_v
+
+
 class Conv2dWeightModulate(nn.Module):
     def __init__(self, d_latent: int, in_planes: int, out_planes: int, kernel_size: int, demodulate: bool = True,
                  eps: float = 1e-8):
         super(Conv2dWeightModulate, self).__init__()
         self.to_style = nn.Sequential(
+            MappingNetwork(d_latent, 2),
             EqualizedLinear(d_latent, in_planes)
         )
         self.out_planes = out_planes
