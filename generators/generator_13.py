@@ -128,9 +128,9 @@ class SKConvT(nn.Module):
         fea_s = self.gap(fea_u).view(b, c)
         fea_z = self.fc_main(fea_s)
 
-        fc_cpnvT = self.fc_convT(fea_z).unsqueeze_(dim=1)
+        fc_convT = self.fc_convT(fea_z).unsqueeze_(dim=1)
         fc_bic = self.fc_bic(fea_z).unsqueeze_(dim=1)
-        attention_vectors = torch.cat([fc_cpnvT, fc_bic], dim=1)
+        attention_vectors = torch.cat([fc_convT, fc_bic], dim=1)
 
         attention_vectors = self.softmax(attention_vectors)
         attention_vectors = attention_vectors.view(b, s, c, 1, 1)
@@ -314,31 +314,77 @@ class ResnetInit(nn.Module):
         self.residual_across = StyleBlock(d_latent, last_planes, in_planes, out_planes, 0, kernel_size, m)
         self.transient_across = StyleBlock(d_latent, last_planes, in_planes, out_planes, dense_depth, kernel_size, m)
 
-        self.se_residual = SEBlock(out_planes + dense_depth)
-        self.se_transient = SEBlock(out_planes)
-        self.se_residual_across = SEBlock(out_planes)
-        self.se_transient_across = SEBlock(out_planes + dense_depth)
+        self.gap = nn.AdaptiveAvgPool2d(1)
 
+        self.fc_residual = MappingNetwork(out_planes + dense_depth, 4)
+
+        self.fc_residual_r_r = nn.Sequential(
+            MappingNetwork(out_planes + dense_depth, 2),
+            EqualizedLinear(out_planes + dense_depth, out_planes + dense_depth)
+        )
+
+        self.fc_transient_t_r = nn.Sequential(
+            MappingNetwork(out_planes + dense_depth, 2),
+            EqualizedLinear(out_planes + dense_depth, out_planes + dense_depth)
+        )
+
+        self.fc_transient = MappingNetwork(out_planes, 4)
+
+        self.fc_residual_r_t = nn.Sequential(
+            MappingNetwork(out_planes, 2),
+            EqualizedLinear(out_planes, out_planes)
+        )
+
+        self.fc_transient_t_t = nn.Sequential(
+            MappingNetwork(out_planes, 2),
+            EqualizedLinear(out_planes, out_planes)
+        )
+
+        self.softmax = nn.Softmax(dim=1)
         self.activation_residual = nn.PReLU(out_planes + dense_depth)
         self.activation_transient = nn.PReLU(out_planes)
 
     def forward(self, x: Tuple[torch.Tensor, torch.Tensor], w: torch.Tensor):
         x_residual, x_transient = x
-        residual_r_r = self.residual(x_residual, w)
-        residual_r_r = residual_r_r * self.se_residual(residual_r_r)
-        residual_r_t = self.residual_across(x_residual, w)
-        residual_r_t = residual_r_t * self.se_residual_across(residual_r_t)
 
-        transient_t_t = self.transient(x_transient, w)
-        transient_t_t = transient_t_t * self.se_transient(transient_t_t)
-        transient_t_r = self.transient_across(x_transient, w)
-        transient_t_r = transient_t_r * self.se_transient_across(transient_t_r)
+        residual_r_r = self.residual(x_residual, w).unsqueeze_(dim=1)
+        residual_r_t = self.residual_across(x_residual, w).unsqueeze_(dim=1)
+        transient_t_t = self.transient(x_transient, w).unsqueeze_(dim=1)
+        transient_t_r = self.transient_across(x_transient, w).unsqueeze_(dim=1)
 
-        x_residual = residual_r_r + transient_t_r
-        x_transient = residual_r_t + transient_t_t
+        feas_residual = torch.cat([residual_r_r, transient_t_r], dim=1)
+        feas_transient = torch.cat([residual_r_t, transient_t_t], dim=1)
 
-        x_residual = self.activation_residual(x_residual)
-        x_transient = self.activation_transient(x_transient)
+        b_residual, s_residual, c_residual, _, _ = feas_residual.shape
+        b_transient, s_transient, c_transient, _, _ = feas_transient.shape
+
+        fea_residual_u = torch.sum(feas_residual, dim=1)
+        fea_transient_u = torch.sum(feas_transient, dim=1)
+
+        fea_residual_s = self.gap(fea_residual_u).view(b_residual, c_residual)
+        fea_transient_s = self.gap(fea_transient_u).view(b_transient, c_transient)
+
+        fea_residual_z = self.fc_residual(fea_residual_s)
+        fea_transient_z = self.fc_transient(fea_transient_s)
+
+        fc_residual_r_r = self.fc_residual_r_r(fea_residual_z).unsqueeze_(dim=1)
+        fc_transient_t_r = self.fc_transient_t_r(fea_residual_z).unsqueeze_(dim=1)
+        attention_residual_vectors = torch.cat([fc_residual_r_r, fc_transient_t_r], dim=1)
+
+        fc_residual_r_t = self.fc_residual_r_t(fea_transient_z).unsqueeze_(dim=1)
+        fc_transient_t_t = self.fc_transient_t_t(fea_transient_z).unsqueeze_(dim=1)
+        attention_transient_vectors = torch.cat([fc_residual_r_t, fc_transient_t_t], dim=1)
+
+        attention_residual_vectors = self.softmax(attention_residual_vectors)
+        attention_residual_vectors = attention_residual_vectors.view(b_residual, s_residual, c_residual, 1, 1)
+        fea_residual_v = (feas_residual * attention_residual_vectors).sum(dim=1)
+
+        attention_transient_vectors = self.softmax(attention_transient_vectors)
+        attention_transient_vectors = attention_transient_vectors.view(b_transient, s_transient, c_transient, 1, 1)
+        fea_transient_v = (feas_transient * attention_transient_vectors).sum(dim=1)
+
+        x_residual = self.activation_residual(fea_residual_v)
+        x_transient = self.activation_transient(fea_transient_v)
 
         return x_residual, x_transient
 
