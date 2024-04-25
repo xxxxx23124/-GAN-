@@ -238,27 +238,37 @@ class SKConv(nn.Module):
 
 class StyleBlock(nn.Module):
     def __init__(self, d_latent: int, last_planes: int, in_planes: int, out_planes: int, dense_depth: int,
-                 kernel_size: int):
+                 kernel_size: int, m: int):
         super(StyleBlock, self).__init__()
+        assert (m > 0)
         self.conv1 = StyleConv(d_latent, last_planes, in_planes, kernel_size=1)
         self.activation1 = nn.PReLU(in_planes)
-        self.conv2 = SKConv(d_latent, in_planes, in_planes, 2)
+        self.m = m
+        if m == 1:
+            self.conv2 = StyleConv(d_latent, in_planes, in_planes, kernel_size=kernel_size)
+            self.activation2 = nn.PReLU(in_planes)
+        else:
+            self.skconv = SKConv(d_latent, in_planes, in_planes, m)
         self.conv3 = StyleConv(d_latent, in_planes, out_planes + dense_depth, kernel_size=kernel_size, use_noise=False)
 
     def forward(self, x: torch.Tensor, w: torch.Tensor):
         x = self.conv1(x, w)
         x = self.activation1(x)
-        x = self.conv2(x, w)
+        if self.m == 1:
+            x = self.conv2(x, w)
+            x = self.activation2(x)
+        else:
+            x = self.skconv(x, w)
         x = self.conv3(x, w)
         return x
 
 
 class SEBlock(nn.Module):
-    def __init__(self, in_planes: int, out_planes: int):
+    def __init__(self, in_planes: int):
         super(SEBlock, self).__init__()
         self.gap = nn.AdaptiveAvgPool2d(1)
         self.fcs = MappingNetwork(in_planes, 2)
-        self.fc_out = EqualizedLinear(in_planes, out_planes)
+        self.fc_out = EqualizedLinear(in_planes, in_planes)
         self.activation2 = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor):
@@ -276,7 +286,7 @@ class SelfAttention(nn.Module):
         self.key = EqualizedConv2d(in_planes, embedding_channels, 3)
         self.value = EqualizedConv2d(in_planes, embedding_channels, 3)
         self.self_att = EqualizedConv2d(embedding_channels, in_planes, 3)
-        self.gamma = SEBlock(in_planes, in_planes)
+        self.gamma = SEBlock(in_planes)
         self.softmax = nn.Softmax(dim=1)
 
     def forward(self, x: torch.Tensor):
@@ -295,17 +305,18 @@ class SelfAttention(nn.Module):
 
 
 class ResnetInit(nn.Module):
-    def __init__(self, d_latent, last_planes, in_planes, out_planes, dense_depth, kernel_size):
+    def __init__(self, d_latent: int, last_planes: int, in_planes: int, out_planes: int, dense_depth: int,
+                 kernel_size: int, m: int):
         super(ResnetInit, self).__init__()
-        self.residual = StyleBlock(d_latent, last_planes, in_planes, out_planes, dense_depth, kernel_size)
-        self.transient = StyleBlock(d_latent, last_planes, in_planes, out_planes, 0, kernel_size)
-        self.residual_across = StyleBlock(d_latent, last_planes, in_planes, out_planes, 0, kernel_size)
-        self.transient_across = StyleBlock(d_latent, last_planes, in_planes, out_planes, dense_depth, kernel_size)
+        self.residual = StyleBlock(d_latent, last_planes, in_planes, out_planes, dense_depth, kernel_size, m)
+        self.transient = StyleBlock(d_latent, last_planes, in_planes, out_planes, 0, kernel_size, m)
+        self.residual_across = StyleBlock(d_latent, last_planes, in_planes, out_planes, 0, kernel_size, m)
+        self.transient_across = StyleBlock(d_latent, last_planes, in_planes, out_planes, dense_depth, kernel_size, m)
 
-        self.se_residual = SEBlock(out_planes + dense_depth, out_planes + dense_depth)
-        self.se_transient = SEBlock(out_planes, out_planes)
-        self.se_residual_across = SEBlock(out_planes, out_planes)
-        self.se_transient_across = SEBlock(out_planes + dense_depth, out_planes + dense_depth)
+        self.se_residual = SEBlock(out_planes + dense_depth)
+        self.se_transient = SEBlock(out_planes)
+        self.se_residual_across = SEBlock(out_planes)
+        self.se_transient_across = SEBlock(out_planes + dense_depth)
 
         self.activation_residual = nn.PReLU(out_planes + dense_depth)
         self.activation_transient = nn.PReLU(out_planes)
@@ -331,20 +342,6 @@ class ResnetInit(nn.Module):
         return x_residual, x_transient
 
 
-class ToRGB(nn.Module):
-    def __init__(self, d_latent: int, planes: int):
-        super().__init__()
-        self.pre_conv = SKConv(d_latent, planes, planes, 2)
-        self.conv = Conv2dWeightModulate(d_latent, planes, 3, kernel_size=1, demodulate=False)
-        self.bias = nn.Parameter(torch.nn.init.normal_(torch.empty(3), mean=0, std=1))
-        self.activation = nn.PReLU(3)
-
-    def forward(self, x: torch.Tensor, w: torch.Tensor):
-        x = self.pre_conv(x, w)
-        x = self.conv(x, w)
-        return self.activation(x + self.bias[None, :, None, None])
-
-
 class BasicBlock(nn.Module):
 
     def get_out_planes(self):
@@ -357,7 +354,7 @@ class BasicBlock(nn.Module):
                 return self.last_planes + 1 * self.dense_depth
 
     def __init__(self, d_latent: int, last_planes: int, in_planes: int, out_planes: int, dense_depth: int, root: bool,
-                 is_unify: bool):
+                 is_unify: bool, m: int):
         super(BasicBlock, self).__init__()
         self.root = root
         self.last_planes = last_planes
@@ -370,9 +367,9 @@ class BasicBlock(nn.Module):
 
         if is_unify:
             self.unify = StyleConv(d_latent, last_planes, 2 * out_planes + dense_depth, kernel_size=1)
-            self.rir_3 = ResnetInit(d_latent, out_planes + dense_depth, in_planes, out_planes, dense_depth, 3)
+            self.rir_3 = ResnetInit(d_latent, out_planes + dense_depth, in_planes, out_planes, dense_depth, 3, m)
         else:
-            self.rir_3 = ResnetInit(d_latent, last_planes - out_planes, in_planes, out_planes, dense_depth, 3)
+            self.rir_3 = ResnetInit(d_latent, last_planes - out_planes, in_planes, out_planes, dense_depth, 3, m)
 
         if root:
             self.shortcut = StyleConv(d_latent, last_planes, 2 * out_planes + dense_depth, kernel_size=1)
@@ -400,12 +397,36 @@ class BasicBlock(nn.Module):
         return out
 
 
+class ToRGB(nn.Module):
+    def __init__(self, d_latent: int, planes: int, m: int):
+        super().__init__()
+        assert (m > 0)
+        self.m = m
+        if m == 1:
+            self.pre_conv = StyleConv(d_latent, planes, planes, 3)
+            self.pre_activation = nn.PReLU(planes)
+        else:
+            self.skconv = SKConv(d_latent, planes, planes, m)
+        self.conv = Conv2dWeightModulate(d_latent, planes, 3, kernel_size=1, demodulate=False)
+        self.bias = nn.Parameter(torch.nn.init.normal_(torch.empty(3), mean=0, std=1))
+        self.activation = nn.PReLU(3)
+
+    def forward(self, x: torch.Tensor, w: torch.Tensor):
+        if self.m == 1:
+            x = self.pre_conv(x, w)
+            x = self.pre_activation(x)
+        else:
+            x = self.skconv(x, w)
+        x = self.conv(x, w)
+        return self.activation(x + self.bias[None, :, None, None])
+
+
 class Tree(nn.Module):
     def get_out_planes(self):
         return self.root.get_out_planes()
 
     def __init__(self, d_latent: int, last_planes: int, in_planes: int, out_planes: int, dense_depth: int, level: int,
-                 block_num: int):
+                 block_num: int, m: int):
         super(Tree, self).__init__()
         assert (block_num > 0)
         self.level = level
@@ -416,38 +437,38 @@ class Tree(nn.Module):
         if level == 1:
             self.root_last_planes = 2 * out_planes * (block_num - 1)
             sub_block = BasicBlock(d_latent, last_planes, in_planes, out_planes, dense_depth, False,
-                                   last_planes < 2 * out_planes)
+                                   last_planes < 2 * out_planes, m)
             last_planes = sub_block.get_out_planes()
             self.__setattr__('block_%d' % 0, sub_block)
             for i in range(1, block_num):
                 sub_block = BasicBlock(d_latent, last_planes, in_planes, out_planes, dense_depth, False,
-                                       False)
+                                       False, m)
                 last_planes = sub_block.get_out_planes()
                 self.__setattr__('block_%d' % i, sub_block)
             self.root_last_planes += sub_block.get_out_planes()
             self.root = BasicBlock(d_latent, self.root_last_planes, in_planes * block_num, out_planes, dense_depth,
-                                   True, False)
+                                   True, False, m)
 
         else:
             self.root_last_planes = 2 * out_planes * (block_num - 1)
             self.prev_root = BasicBlock(d_latent, last_planes, in_planes, out_planes, dense_depth, False,
-                                        last_planes < 2 * out_planes)
+                                        last_planes < 2 * out_planes, m)
             self.root_last_planes += self.prev_root.get_out_planes()
 
             for i in reversed(range(1, level)):
-                subtree = Tree(d_latent, last_planes, in_planes, out_planes, dense_depth, i, block_num)
+                subtree = Tree(d_latent, last_planes, in_planes, out_planes, dense_depth, i, block_num, m)
                 last_planes = subtree.get_out_planes()
                 self.root_last_planes += last_planes
                 self.__setattr__('level_%d' % i, subtree)
 
             for i in range(block_num):
-                sub_block = BasicBlock(d_latent, last_planes, in_planes, out_planes, dense_depth, False, False)
+                sub_block = BasicBlock(d_latent, last_planes, in_planes, out_planes, dense_depth, False, False, m)
                 last_planes = sub_block.get_out_planes()
                 self.__setattr__('block_%d' % i, sub_block)
             self.root_last_planes += sub_block.get_out_planes()
             self.root = BasicBlock(d_latent, self.root_last_planes, in_planes * block_num, out_planes, dense_depth,
-                                   True, False)
-        self.to_rgb = ToRGB(d_latent, self.get_out_planes())
+                                   True, False, m)
+        self.to_rgb = ToRGB(d_latent, self.get_out_planes(), m)
 
     def forward(self, x: torch.Tensor, w: torch.Tensor, rgb: torch.Tensor):
         d = self.out_planes
@@ -473,11 +494,11 @@ class GeneratorBlock(nn.Module):
         return self.tree.get_out_planes()
 
     def __init__(self, d_latent: int, last_planes: int, in_planes: int, out_planes: int, dense_depth: int, level: int,
-                 block_num: int):
+                 block_num: int, m: int):
         super(GeneratorBlock, self).__init__()
 
         self.upsample = SKConvT(last_planes)
-        self.tree = Tree(d_latent, last_planes, in_planes, out_planes, dense_depth, level, block_num)
+        self.tree = Tree(d_latent, last_planes, in_planes, out_planes, dense_depth, level, block_num, m)
         self.upsample_rgb = SKConvT(3)
 
     def forward(self, x: torch.Tensor, w: torch.Tensor, rgb: torch.Tensor):
@@ -492,13 +513,13 @@ class GeneratorStart(nn.Module):
         return self.tree.get_out_planes()
 
     def __init__(self, z_dim: int, mapping_layer: int, in_planes: int, out_planes: int, dense_depth: int, level: int,
-                 block_num: int):
+                 block_num: int, m: int):
         super(GeneratorStart, self).__init__()
         self.mapping_network = MappingNetwork(z_dim, mapping_layer)
         self.convT = EqualizedConvTranspose2D(z_dim, out_planes, kernel_size=4, stride=1, padding=0)
         self.activation = nn.PReLU(out_planes)
-        self.to_rgb = ToRGB(z_dim, out_planes)
-        self.tree = Tree(z_dim, out_planes, in_planes, out_planes // 2, dense_depth, level, block_num)
+        self.to_rgb = ToRGB(z_dim, out_planes, m)
+        self.tree = Tree(z_dim, out_planes, in_planes, out_planes // 2, dense_depth, level, block_num, m)
 
     def forward(self, x: torch.Tensor):
         w = self.mapping_network(torch.squeeze(x))
@@ -514,15 +535,15 @@ class Generator(nn.Module):
         super(Generator, self).__init__()
 
         self.block0 = GeneratorStart(z_dim, 8, planes * 8, planes * 8, planes // 8, 1,
-                                     1)
+                                     1, 1)
         self.block1 = GeneratorBlock(z_dim, self.block0.get_out_planes(), planes * 4, planes * 4, planes // 8, 1,
-                                     1)  # 8
+                                     1, 2)  # 8
         self.block2 = GeneratorBlock(z_dim, self.block1.get_out_planes(), planes * 2, planes * 2, planes // 8, 1,
-                                     1)  # 16
+                                     1, 2)  # 16
         self.block3 = GeneratorBlock(z_dim, self.block2.get_out_planes(), planes * 1, planes * 1, planes // 8, 1,
-                                     1)  # 32
+                                     1, 2)  # 32
         self.block4 = GeneratorBlock(z_dim, self.block3.get_out_planes(), planes * 1, planes * 1, planes // 8, 1,
-                                     1)  # 64
+                                     1, 2)  # 64
 
     def forward(self, x: torch.Tensor):
         x, w, rgb = self.block0(x)
