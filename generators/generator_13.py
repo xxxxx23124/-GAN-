@@ -156,13 +156,13 @@ class SKConvT(nn.Module):
         self.up_sample = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=False)
         self.smooth = Smooth()
 
-        self.attention = SKAttention_conv(planes, 2)
+        self.sk_attention = SKAttention_conv(planes, 2)
 
     def forward(self, x: torch.Tensor):
         fea_convT = self.activation_convT(self.convT(x)).unsqueeze_(dim=1)
         fea_bic = self.smooth(self.up_sample(x)).unsqueeze_(dim=1)
         feas = torch.cat([fea_convT, fea_bic], dim=1)
-        fea_v = (feas * self.attention(feas)).sum(dim=1)
+        fea_v = (feas * self.sk_attention(feas)).sum(dim=1)
         return fea_v
 
 
@@ -225,7 +225,7 @@ class SKConv(nn.Module):
             nonlinear = nn.PReLU(out_planes)
             self.__setattr__('nonlinear_%d' % i, nonlinear)
 
-        self.attention = SKAttention_conv(out_planes, m)
+        self.sk_attention = SKAttention_conv(out_planes, m)
 
     def forward(self, x: torch.Tensor, w: torch.Tensor):
         for i in range(self.M):
@@ -237,7 +237,7 @@ class SKConv(nn.Module):
             else:
                 feas = torch.cat([feas, fea], dim=1)
 
-        fea_v = (feas * self.attention(feas)).sum(dim=1)
+        fea_v = (feas * self.sk_attention(feas)).sum(dim=1)
         return fea_v
 
 
@@ -350,11 +350,11 @@ class ResnetInit(nn.Module):
         self.residual_across = StyleBlock(d_latent, last_planes, in_planes, out_planes, 0, kernel_size, m)
         self.transient_across = StyleBlock(d_latent, last_planes, in_planes, out_planes, dense_depth, kernel_size, m)
         if image_size > 4:
-            self.attention_residual = SKAttention_conv(out_planes + dense_depth, 2)
-            self.attention_transient = SKAttention_conv(out_planes, 2)
+            self.sk_attention_residual = SKAttention_conv(out_planes + dense_depth, 2)
+            self.sk_attention_transient = SKAttention_conv(out_planes, 2)
         else:
-            self.attention_residual = SKAttention_fc(out_planes + dense_depth, 2)
-            self.attention_transient = SKAttention_fc(out_planes, 2)
+            self.sk_attention_residual = SKAttention_fc(out_planes + dense_depth, 2)
+            self.sk_attention_transient = SKAttention_fc(out_planes, 2)
 
 
     def forward(self, x: Tuple[torch.Tensor, torch.Tensor], w: torch.Tensor):
@@ -368,8 +368,8 @@ class ResnetInit(nn.Module):
         feas_residual = torch.cat([residual_r_r, transient_t_r], dim=1)
         feas_transient = torch.cat([residual_r_t, transient_t_t], dim=1)
 
-        fea_residual_v = (feas_residual * self.attention_residual(feas_residual)).sum(dim=1)
-        fea_transient_v = (feas_transient * self.attention_transient(feas_transient)).sum(dim=1)
+        fea_residual_v = (feas_residual * self.sk_attention_residual(feas_residual)).sum(dim=1)
+        fea_transient_v = (feas_transient * self.sk_attention_transient(feas_transient)).sum(dim=1)
         return fea_residual_v, fea_transient_v
 
 
@@ -502,9 +502,9 @@ class Tree(nn.Module):
 
         self.to_rgb = ToRGB(d_latent, self.get_out_planes(), m)
         if image_size > 4:
-            self.attention = SKAttention_conv(3, 2)
+            self.sk_attention = SKAttention_conv(3, 2)
         else:
-            self.attention = SKAttention_fc(3, 2)
+            self.sk_attention = SKAttention_fc(3, 2)
 
     def forward(self, x: torch.Tensor, w: torch.Tensor, rgb: torch.Tensor):
         d = self.out_planes
@@ -524,7 +524,7 @@ class Tree(nn.Module):
         rgb.unsqueeze_(dim=1)
         rgb_new.unsqueeze_(dim=1)
         feas = torch.cat([rgb, rgb_new], dim=1)
-        rgb = (feas * self.attention(feas)).sum(dim=1)
+        rgb = (feas * self.sk_attention(feas)).sum(dim=1)
         return out, rgb
 
 
