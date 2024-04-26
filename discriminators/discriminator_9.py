@@ -39,28 +39,44 @@ class EqualizedConv2d(nn.Module):
         x = nn.functional.pad(input=x, pad=(self.padding, self.padding, self.padding, self.padding), mode="replicate")
         return nn.functional.conv2d(x, self.weight(), bias=self.bias, stride=self.stride)
 
+class SEBlock(nn.Module):
+    def __init__(self, in_planes: int, out_planes: int):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv1 = EqualizedConv2d(in_planes, in_planes, kernel_size=1)
+        self.activation1 = nn.PReLU(in_planes)
+        self.conv2 = EqualizedConv2d(in_planes, out_planes, kernel_size=1)
+        self.activation2 = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor):
+        x = self.avg_pool(x)
+        x = self.conv1(x)
+        x = self.activation1(x)
+        x = self.conv2(x)
+        return self.activation2(x)
+
 class SelfAttention(nn.Module):
     def __init__(self, in_planes: int, embedding_channels: int):
         super(SelfAttention, self).__init__()
-        self.key = EqualizedConv2d(in_planes, embedding_channels, 1)
         self.query = EqualizedConv2d(in_planes, embedding_channels, 1)
+        self.key = EqualizedConv2d(in_planes, embedding_channels, 1)
         self.value = EqualizedConv2d(in_planes, embedding_channels, 1)
         self.self_att = EqualizedConv2d(embedding_channels, in_planes, 1)
-        self.gamma = nn.Parameter(torch.nn.init.uniform_(torch.empty(in_planes), a=0.2, b=0.3))
+        self.gamma = SEBlock(in_planes, in_planes)
         self.softmax = nn.Softmax(dim=1)
 
     def forward(self, x: torch.Tensor):
         B, C, H, W = x.size()
         N = H * W
-        f_x = self.key(x).view(B, -1, N)
-        g_x = self.query(x).view(B, -1, N)
+        f_x = self.query(x).view(B, -1, N)
+        g_x = self.key(x).view(B, -1, N)
         h_x = self.value(x).view(B, -1, N)
         s = torch.bmm(f_x.permute(0, 2, 1), g_x)
         beta = self.softmax(s)
         v = torch.bmm(h_x, beta)
         v = v.view(B, -1, H, W)
         o = self.self_att(v)
-        y = self.gamma[None, :, None, None] * o + x
+        y = self.gamma(o) * o + x
         return y
 
 class MiniBatchStdDev(nn.Module):
@@ -108,28 +124,29 @@ class DiscriminatorBlock(nn.Module):
     def __init__(self, in_features, out_features, downsample):
         super().__init__()
         self.residual = nn.Sequential()
-        self.down_sample = nn.Sequential()
-        if downsample:
-            self.residual = nn.Sequential(DownSample(),
-                                          EqualizedConv2d(in_features, out_features, kernel_size=1))
-            self.down_sample = nn.Sequential(
-                EqualizedConv2d(out_features, out_features, kernel_size=3, padding=1, stride=2),
-                nn.LeakyReLU(0.2, True),
-                Smooth()
-            )
         self.block = nn.Sequential(
             EqualizedConv2d(in_features, in_features, kernel_size=3, padding=1),
             nn.LeakyReLU(0.2, True),
             EqualizedConv2d(in_features, out_features, kernel_size=3, padding=1),
             nn.LeakyReLU(0.2, True),
         )
-        self.scale = 1 / math.sqrt(2)
+        self.se = SEBlock(out_features, out_features)
+        self.down_sample = nn.Sequential()
+        if downsample:
+            self.residual = nn.Sequential(DownSample(),
+                                          EqualizedConv2d(in_features, out_features, kernel_size=1))
+            self.down_sample = nn.Sequential(
+                Smooth(),
+                EqualizedConv2d(out_features, out_features, kernel_size=3, padding=1, stride=2),
+                nn.LeakyReLU(0.2, True),
+            )
 
     def forward(self, x):
         residual = self.residual(x)
         x = self.block(x)
         x = self.down_sample(x)
-        return (x + residual) * self.scale
+        x = x * self.se(x)
+        return x + residual
 
 class Discriminator(nn.Module):
     def __init__(self):
@@ -139,23 +156,23 @@ class Discriminator(nn.Module):
         self.conv = nn.Sequential(
             EqualizedConv2d(3, features, 3, 1),  # 64
             nn.LeakyReLU(0.2, True),
-            SelfAttention(features, features//8),
+            SelfAttention(features, features),
             DiscriminatorBlock(features, features, False),
             DiscriminatorBlock(features, features, False),
             DiscriminatorBlock(features, 2 * features, True),  # 32
-            SelfAttention(2 * features, features // 4),
+            SelfAttention(2 * features, 2 * features),
             DiscriminatorBlock(2 * features, 2 * features, False),
             DiscriminatorBlock(2 * features, 2 * features, False),
             DiscriminatorBlock(2 * features, 4 * features, True),  # 16
-            SelfAttention(4 * features, features // 2),
+            SelfAttention(4 * features, 4 * features),
             DiscriminatorBlock(4 * features, 4 * features, False),
             DiscriminatorBlock(4 * features, 4 * features, False),
             DiscriminatorBlock(4 * features, 8 * features, True),  # 8
-            SelfAttention(8 * features, features),
+            SelfAttention(8 * features, 8 * features),
             DiscriminatorBlock(8 * features, 8 * features, False),
             DiscriminatorBlock(8 * features, 8 * features, False),
             DiscriminatorBlock(8 * features, 16 * features, True),  # 4
-            SelfAttention(16 * features, features * 2),
+            SelfAttention(16 * features, 16 * features),
             MiniBatchStdDev(),
             DiscriminatorBlock(16 * features + 1, 16 * features + 1, False),
             DiscriminatorBlock(16 * features + 1, 16 * features + 1, False),
