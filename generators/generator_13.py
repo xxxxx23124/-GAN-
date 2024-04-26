@@ -57,30 +57,6 @@ class EqualizedConv2d(nn.Module):
         return nn.functional.conv2d(x, self.weight(), bias=self.bias)
 
 
-class EqualizedWeightConvTranspose2D(nn.Module):
-    def __init__(self, shape: List[int]):
-        super(EqualizedWeightConvTranspose2D, self).__init__()
-        self.shape = shape
-        self.c = 1 / math.sqrt(shape[0])
-        self.weight = nn.Parameter(torch.nn.init.normal_(torch.empty(shape), mean=0, std=1))
-
-    def forward(self):
-        return self.weight * self.c
-
-
-class EqualizedConvTranspose2D(torch.nn.Module):
-    def __init__(self, in_planes, out_planes, kernel_size, stride, padding):
-        super(EqualizedConvTranspose2D, self).__init__()
-        self.padding = padding
-        self.stride = stride
-        self.weight = EqualizedWeightConvTranspose2D([in_planes, out_planes, kernel_size, kernel_size])
-        self.bias = nn.Parameter(torch.nn.init.normal_(torch.empty(out_planes), mean=0, std=1))
-
-    def forward(self, x):
-        return nn.functional.conv_transpose2d(x, self.weight(), bias=self.bias, stride=self.stride,
-                                              padding=self.padding)
-
-
 class MappingNetwork(nn.Module):
     def __init__(self, planes: int, n_layers: int):
         super(MappingNetwork, self).__init__()
@@ -94,47 +70,99 @@ class MappingNetwork(nn.Module):
         return self.net(z)
 
 
+class SKAttention_conv(nn.Module):
+    def __init__(self, planes: int, m: int):
+        super(SKAttention_conv, self).__init__()
+        self.gap_conv = nn.AdaptiveAvgPool2d(5)
+        self.conv_main = nn.Sequential(
+            EqualizedConv2d(planes, planes, 3),
+            nn.PReLU(planes),
+            EqualizedConv2d(planes, planes, 3),
+            nn.PReLU(planes),
+            EqualizedConv2d(planes, planes, 3),
+            nn.PReLU(planes),
+        )
+        self.gap_fc = nn.AdaptiveAvgPool2d(1)
+        self.fc_main = MappingNetwork(planes, 2)
+
+        self.M = m
+        for i in range(m):
+            fc_sub = nn.Sequential(
+                MappingNetwork(planes, 2),
+                EqualizedLinear(planes, planes)
+            )
+            self.__setattr__('fc_sub_%d' % i, fc_sub)
+
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, feas: torch.Tensor):
+        b, s, c, _, _ = feas.shape
+        assert (_ >= 8)
+        fea_u = torch.sum(feas, dim=1)
+        fea_s = self.conv_main(self.gap_conv(fea_u))
+        fea_z = self.fc_main(self.gap_fc(fea_s).view(b, c))
+
+        for i in range(self.M):
+            fc_sub = self.__getattr__('fc_sub_%d' % i)
+            vector = fc_sub(fea_z).unsqueeze_(dim=1)
+            if i == 0:
+                attention_vectors = vector
+            else:
+                attention_vectors = torch.cat([attention_vectors, vector], dim=1)
+
+        attention_vectors = self.softmax(attention_vectors)
+        return attention_vectors.view(b, s, c, 1, 1)
+
+class SKAttention_fc(nn.Module):
+    def __init__(self, planes: int, m: int):
+        super(SKAttention_fc, self).__init__()
+        self.gap_fc = nn.AdaptiveAvgPool2d(1)
+        self.fc_main = MappingNetwork(planes, 4)
+
+        self.M = m
+        for i in range(m):
+            fc_sub = nn.Sequential(
+                MappingNetwork(planes, 2),
+                EqualizedLinear(planes, planes)
+            )
+            self.__setattr__('fc_sub_%d' % i, fc_sub)
+
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, feas: torch.Tensor):
+        b, s, c, _, _ = feas.shape
+        fea_u = torch.sum(feas, dim=1)
+        fea_s = self.gap_fc(fea_u).view(b, c)
+        fea_z = self.fc_main(fea_s)
+
+        for i in range(self.M):
+            fc_sub = self.__getattr__('fc_sub_%d' % i)
+            vector = fc_sub(fea_z).unsqueeze_(dim=1)
+            if i == 0:
+                attention_vectors = vector
+            else:
+                attention_vectors = torch.cat([attention_vectors, vector], dim=1)
+
+        attention_vectors = self.softmax(attention_vectors)
+        return attention_vectors.view(b, s, c, 1, 1)
+
+
 class SKConvT(nn.Module):
     def __init__(self, planes: int):
         super(SKConvT, self).__init__()
-        self.convT = EqualizedConvTranspose2D(planes, planes, kernel_size=4, stride=2, padding=1)
+        self.convT = nn.ConvTranspose2d(planes, planes, kernel_size=4, stride=2, padding=1)
         self.activation_convT = nn.PReLU(planes)
 
         self.up_sample = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=False)
         self.smooth = Smooth()
 
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        self.fc_main = MappingNetwork(planes, 4)
-
-        self.fc_convT = nn.Sequential(
-            MappingNetwork(planes, 2),
-            EqualizedLinear(planes, planes)
-        )
-
-        self.fc_bic = nn.Sequential(
-            MappingNetwork(planes, 2),
-            EqualizedLinear(planes, planes)
-        )
-
-        self.softmax = nn.Softmax(dim=1)
+        self.attention = SKAttention_conv(planes, 2)
 
     def forward(self, x: torch.Tensor):
         fea_convT = self.activation_convT(self.convT(x)).unsqueeze_(dim=1)
         fea_bic = self.smooth(self.up_sample(x)).unsqueeze_(dim=1)
         feas = torch.cat([fea_convT, fea_bic], dim=1)
-
-        b, s, c, _, _ = feas.shape
-        fea_u = torch.sum(feas, dim=1)
-        fea_s = self.gap(fea_u).view(b, c)
-        fea_z = self.fc_main(fea_s)
-
-        fc_convT = self.fc_convT(fea_z).unsqueeze_(dim=1)
-        fc_bic = self.fc_bic(fea_z).unsqueeze_(dim=1)
-        attention_vectors = torch.cat([fc_convT, fc_bic], dim=1)
-
-        attention_vectors = self.softmax(attention_vectors)
-        attention_vectors = attention_vectors.view(b, s, c, 1, 1)
-        fea_v = (feas * attention_vectors).sum(dim=1)
+        fea_v = (feas * self.attention(feas)).sum(dim=1)
         return fea_v
 
 
@@ -197,16 +225,7 @@ class SKConv(nn.Module):
             nonlinear = nn.PReLU(out_planes)
             self.__setattr__('nonlinear_%d' % i, nonlinear)
 
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        self.fc_main = MappingNetwork(out_planes, 4)
-        for i in range(m):
-            fc_sub = nn.Sequential(
-                MappingNetwork(out_planes, 2),
-                EqualizedLinear(out_planes, out_planes)
-            )
-            self.__setattr__('fc_sub_%d' % i, fc_sub)
-
-        self.softmax = nn.Softmax(dim=1)
+        self.attention = SKAttention_conv(out_planes, m)
 
     def forward(self, x: torch.Tensor, w: torch.Tensor):
         for i in range(self.M):
@@ -218,22 +237,7 @@ class SKConv(nn.Module):
             else:
                 feas = torch.cat([feas, fea], dim=1)
 
-        b, s, c, _, _ = feas.shape
-        fea_u = torch.sum(feas, dim=1)
-        fea_s = self.gap(fea_u).view(b, c)
-        fea_z = self.fc_main(fea_s)
-
-        for i in range(self.M):
-            fc_sub = self.__getattr__('fc_sub_%d' % i)
-            vector = fc_sub(fea_z).unsqueeze_(dim=1)
-            if i == 0:
-                attention_vectors = vector
-            else:
-                attention_vectors = torch.cat([attention_vectors, vector], dim=1)
-
-        attention_vectors = self.softmax(attention_vectors)
-        attention_vectors = attention_vectors.view(b, s, c, 1, 1)
-        fea_v = (feas * attention_vectors).sum(dim=1)
+        fea_v = (feas * self.attention(feas)).sum(dim=1)
         return fea_v
 
 
@@ -251,6 +255,7 @@ class StyleBlock(nn.Module):
         else:
             self.skconv = SKConv(d_latent, in_planes, in_planes, m)
         self.conv3 = StyleConv(d_latent, in_planes, out_planes + dense_depth, kernel_size=kernel_size, use_noise=False)
+        self.activation3 = nn.PReLU(out_planes + dense_depth)
 
     def forward(self, x: torch.Tensor, w: torch.Tensor):
         x = self.conv1(x, w)
@@ -261,12 +266,38 @@ class StyleBlock(nn.Module):
         else:
             x = self.skconv(x, w)
         x = self.conv3(x, w)
+        x = self.activation3(x)
         return x
 
-
-class SEBlock(nn.Module):
+class SEBlock_conv(nn.Module):
     def __init__(self, in_planes: int):
-        super(SEBlock, self).__init__()
+        super(SEBlock_conv, self).__init__()
+        self.gap_conv = nn.AdaptiveAvgPool2d(5)
+        self.convs = nn.Sequential(
+            EqualizedConv2d(in_planes, in_planes, 3),
+            nn.PReLU(in_planes),
+            EqualizedConv2d(in_planes, in_planes, 3),
+            nn.PReLU(in_planes),
+            EqualizedConv2d(in_planes, in_planes, 3),
+            nn.PReLU(in_planes),
+        )
+        self.gap_fc = nn.AdaptiveAvgPool2d(1)
+        self.fcs = MappingNetwork(in_planes, 2)
+        self.fc_out = EqualizedLinear(in_planes, in_planes)
+        self.activation2 = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor):
+        b, c, _, _ = x.shape
+        assert (_ >= 8)
+        x = self.gap_conv(x)
+        x = self.convs(x)
+        x = self.gap_fc(x).view(b, c)
+        x = self.fcs(x)
+        x = self.fc_out(x)
+        return self.activation2(x).view(b, c, 1, 1)
+class SEBlock_fc(nn.Module):
+    def __init__(self, in_planes: int):
+        super(SEBlock_fc, self).__init__()
         self.gap = nn.AdaptiveAvgPool2d(1)
         self.fcs = MappingNetwork(in_planes, 2)
         self.fc_out = EqualizedLinear(in_planes, in_planes)
@@ -281,13 +312,18 @@ class SEBlock(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, in_planes: int, embedding_channels: int):
+    def __init__(self, in_planes: int, embedding_channels: int, image_size: int):
         super(SelfAttention, self).__init__()
         self.query = EqualizedConv2d(in_planes, embedding_channels, 3)
         self.key = EqualizedConv2d(in_planes, embedding_channels, 3)
         self.value = EqualizedConv2d(in_planes, embedding_channels, 3)
         self.self_att = EqualizedConv2d(embedding_channels, in_planes, 3)
-        self.gamma = SEBlock(in_planes)
+
+        if image_size > 4:
+            self.gamma = SEBlock_conv(in_planes)
+        else:
+            self.gamma = SEBlock_fc(in_planes)
+
         self.softmax = nn.Softmax(dim=1)
 
     def forward(self, x: torch.Tensor):
@@ -307,42 +343,19 @@ class SelfAttention(nn.Module):
 
 class ResnetInit(nn.Module):
     def __init__(self, d_latent: int, last_planes: int, in_planes: int, out_planes: int, dense_depth: int,
-                 kernel_size: int, m: int):
+                 kernel_size: int, m: int, image_size: int):
         super(ResnetInit, self).__init__()
         self.residual = StyleBlock(d_latent, last_planes, in_planes, out_planes, dense_depth, kernel_size, m)
         self.transient = StyleBlock(d_latent, last_planes, in_planes, out_planes, 0, kernel_size, m)
         self.residual_across = StyleBlock(d_latent, last_planes, in_planes, out_planes, 0, kernel_size, m)
         self.transient_across = StyleBlock(d_latent, last_planes, in_planes, out_planes, dense_depth, kernel_size, m)
+        if image_size > 4:
+            self.attention_residual = SKAttention_conv(out_planes + dense_depth, 2)
+            self.attention_transient = SKAttention_conv(out_planes, 2)
+        else:
+            self.attention_residual = SKAttention_fc(out_planes + dense_depth, 2)
+            self.attention_transient = SKAttention_fc(out_planes, 2)
 
-        self.gap = nn.AdaptiveAvgPool2d(1)
-
-        self.fc_residual = MappingNetwork(out_planes + dense_depth, 4)
-
-        self.fc_residual_r_r = nn.Sequential(
-            MappingNetwork(out_planes + dense_depth, 2),
-            EqualizedLinear(out_planes + dense_depth, out_planes + dense_depth)
-        )
-
-        self.fc_transient_t_r = nn.Sequential(
-            MappingNetwork(out_planes + dense_depth, 2),
-            EqualizedLinear(out_planes + dense_depth, out_planes + dense_depth)
-        )
-
-        self.fc_transient = MappingNetwork(out_planes, 4)
-
-        self.fc_residual_r_t = nn.Sequential(
-            MappingNetwork(out_planes, 2),
-            EqualizedLinear(out_planes, out_planes)
-        )
-
-        self.fc_transient_t_t = nn.Sequential(
-            MappingNetwork(out_planes, 2),
-            EqualizedLinear(out_planes, out_planes)
-        )
-
-        self.softmax = nn.Softmax(dim=1)
-        self.activation_residual = nn.PReLU(out_planes + dense_depth)
-        self.activation_transient = nn.PReLU(out_planes)
 
     def forward(self, x: Tuple[torch.Tensor, torch.Tensor], w: torch.Tensor):
         x_residual, x_transient = x
@@ -355,38 +368,9 @@ class ResnetInit(nn.Module):
         feas_residual = torch.cat([residual_r_r, transient_t_r], dim=1)
         feas_transient = torch.cat([residual_r_t, transient_t_t], dim=1)
 
-        b_residual, s_residual, c_residual, _, _ = feas_residual.shape
-        b_transient, s_transient, c_transient, _, _ = feas_transient.shape
-
-        fea_residual_u = torch.sum(feas_residual, dim=1)
-        fea_transient_u = torch.sum(feas_transient, dim=1)
-
-        fea_residual_s = self.gap(fea_residual_u).view(b_residual, c_residual)
-        fea_transient_s = self.gap(fea_transient_u).view(b_transient, c_transient)
-
-        fea_residual_z = self.fc_residual(fea_residual_s)
-        fea_transient_z = self.fc_transient(fea_transient_s)
-
-        fc_residual_r_r = self.fc_residual_r_r(fea_residual_z).unsqueeze_(dim=1)
-        fc_transient_t_r = self.fc_transient_t_r(fea_residual_z).unsqueeze_(dim=1)
-        attention_residual_vectors = torch.cat([fc_residual_r_r, fc_transient_t_r], dim=1)
-
-        fc_residual_r_t = self.fc_residual_r_t(fea_transient_z).unsqueeze_(dim=1)
-        fc_transient_t_t = self.fc_transient_t_t(fea_transient_z).unsqueeze_(dim=1)
-        attention_transient_vectors = torch.cat([fc_residual_r_t, fc_transient_t_t], dim=1)
-
-        attention_residual_vectors = self.softmax(attention_residual_vectors)
-        attention_residual_vectors = attention_residual_vectors.view(b_residual, s_residual, c_residual, 1, 1)
-        fea_residual_v = (feas_residual * attention_residual_vectors).sum(dim=1)
-
-        attention_transient_vectors = self.softmax(attention_transient_vectors)
-        attention_transient_vectors = attention_transient_vectors.view(b_transient, s_transient, c_transient, 1, 1)
-        fea_transient_v = (feas_transient * attention_transient_vectors).sum(dim=1)
-
-        x_residual = self.activation_residual(fea_residual_v)
-        x_transient = self.activation_transient(fea_transient_v)
-
-        return x_residual, x_transient
+        fea_residual_v = (feas_residual * self.attention_residual(feas_residual)).sum(dim=1)
+        fea_transient_v = (feas_transient * self.attention_transient(feas_transient)).sum(dim=1)
+        return fea_residual_v, fea_transient_v
 
 
 class BasicBlock(nn.Module):
@@ -401,7 +385,7 @@ class BasicBlock(nn.Module):
                 return self.last_planes + 1 * self.dense_depth
 
     def __init__(self, d_latent: int, last_planes: int, in_planes: int, out_planes: int, dense_depth: int, root: bool,
-                 is_unify: bool, m: int):
+                 is_unify: bool, m: int, image_size: int):
         super(BasicBlock, self).__init__()
         self.root = root
         self.last_planes = last_planes
@@ -414,15 +398,15 @@ class BasicBlock(nn.Module):
 
         if is_unify:
             self.unify = StyleConv(d_latent, last_planes, 2 * out_planes + dense_depth, kernel_size=1)
-            self.rir_3 = ResnetInit(d_latent, out_planes + dense_depth, in_planes, out_planes, dense_depth, 3, m)
+            self.rir_3 = ResnetInit(d_latent, out_planes + dense_depth, in_planes, out_planes, dense_depth, 3, m, image_size)
         else:
-            self.rir_3 = ResnetInit(d_latent, last_planes - out_planes, in_planes, out_planes, dense_depth, 3, m)
+            self.rir_3 = ResnetInit(d_latent, last_planes - out_planes, in_planes, out_planes, dense_depth, 3, m, image_size)
 
         if root:
             self.shortcut = StyleConv(d_latent, last_planes, 2 * out_planes + dense_depth, kernel_size=1)
 
-        self.attention_residual = SelfAttention(out_planes + dense_depth, out_planes + dense_depth)
-        self.attention_transient = SelfAttention(out_planes, out_planes)
+        self.attention_residual = SelfAttention(out_planes + dense_depth, out_planes + dense_depth, image_size)
+        self.attention_transient = SelfAttention(out_planes, out_planes, image_size)
 
     def forward(self, x: torch.Tensor, w: torch.Tensor):
         d = self.out_planes
@@ -473,7 +457,7 @@ class Tree(nn.Module):
         return self.root.get_out_planes()
 
     def __init__(self, d_latent: int, last_planes: int, in_planes: int, out_planes: int, dense_depth: int, level: int,
-                 block_num: int, m: int):
+                 block_num: int, m: int, image_size: int):
         super(Tree, self).__init__()
         assert (block_num > 0)
         self.level = level
@@ -484,38 +468,52 @@ class Tree(nn.Module):
         if level == 1:
             self.root_last_planes = 2 * out_planes * (block_num - 1)
             sub_block = BasicBlock(d_latent, last_planes, in_planes, out_planes, dense_depth, False,
-                                   last_planes < 2 * out_planes, m)
+                                   last_planes < 2 * out_planes, m, image_size)
             last_planes = sub_block.get_out_planes()
             self.__setattr__('block_%d' % 0, sub_block)
             for i in range(1, block_num):
                 sub_block = BasicBlock(d_latent, last_planes, in_planes, out_planes, dense_depth, False,
-                                       False, m)
+                                       False, m, image_size)
                 last_planes = sub_block.get_out_planes()
                 self.__setattr__('block_%d' % i, sub_block)
             self.root_last_planes += sub_block.get_out_planes()
             self.root = BasicBlock(d_latent, self.root_last_planes, in_planes * block_num, out_planes, dense_depth,
-                                   True, False, m)
+                                   True, False, m, image_size)
 
         else:
             self.root_last_planes = 2 * out_planes * (block_num - 1)
             self.prev_root = BasicBlock(d_latent, last_planes, in_planes, out_planes, dense_depth, False,
-                                        last_planes < 2 * out_planes, m)
+                                        last_planes < 2 * out_planes, m, image_size)
             self.root_last_planes += self.prev_root.get_out_planes()
 
             for i in reversed(range(1, level)):
-                subtree = Tree(d_latent, last_planes, in_planes, out_planes, dense_depth, i, block_num, m)
+                subtree = Tree(d_latent, last_planes, in_planes, out_planes, dense_depth, i, block_num, m, image_size)
                 last_planes = subtree.get_out_planes()
                 self.root_last_planes += last_planes
                 self.__setattr__('level_%d' % i, subtree)
 
             for i in range(block_num):
-                sub_block = BasicBlock(d_latent, last_planes, in_planes, out_planes, dense_depth, False, False, m)
+                sub_block = BasicBlock(d_latent, last_planes, in_planes, out_planes, dense_depth, False, False, m, image_size)
                 last_planes = sub_block.get_out_planes()
                 self.__setattr__('block_%d' % i, sub_block)
             self.root_last_planes += sub_block.get_out_planes()
             self.root = BasicBlock(d_latent, self.root_last_planes, in_planes * block_num, out_planes, dense_depth,
-                                   True, False, m)
+                                   True, False, m, image_size)
+
         self.to_rgb = ToRGB(d_latent, self.get_out_planes(), m)
+
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.fc_main = MappingNetwork(3, 4)
+        self.fc_old = nn.Sequential(
+            MappingNetwork(3, 2),
+            EqualizedLinear(3, 3)
+        )
+
+        self.fc_new = nn.Sequential(
+            MappingNetwork(3, 2),
+            EqualizedLinear(3, 3)
+        )
+        self.softmax = nn.Softmax(dim=1)
 
     def forward(self, x: torch.Tensor, w: torch.Tensor, rgb: torch.Tensor):
         d = self.out_planes
@@ -532,7 +530,25 @@ class Tree(nn.Module):
         xs = torch.cat(xs, 1)
         out = self.root(xs, w)
         rgb_new = self.to_rgb(out, w)
-        rgb = rgb + rgb_new
+
+        rgb.unsqueeze_(dim=1)
+        rgb_new.unsqueeze_(dim=1)
+        feas = torch.cat([rgb, rgb_new], dim=1)
+
+        b, s, c, _, _ = feas.shape
+        fea_u = torch.sum(feas, dim=1)
+        fea_s = self.gap(fea_u).view(b, c)
+        fea_z = self.fc_main(fea_s)
+
+        fc_old = self.fc_old(fea_z).unsqueeze_(dim=1)
+        fc_new = self.fc_new(fea_z).unsqueeze_(dim=1)
+
+        attention_vectors = torch.cat([fc_old, fc_new], dim=1)
+        attention_vectors = self.softmax(attention_vectors)
+        attention_vectors = attention_vectors.view(b, s, c, 1, 1)
+
+        rgb = (feas * attention_vectors).sum(dim=1)
+
         return out, rgb
 
 
@@ -541,11 +557,11 @@ class GeneratorBlock(nn.Module):
         return self.tree.get_out_planes()
 
     def __init__(self, d_latent: int, last_planes: int, in_planes: int, out_planes: int, dense_depth: int, level: int,
-                 block_num: int, m: int):
+                 block_num: int, m: int, image_size: int):
         super(GeneratorBlock, self).__init__()
 
         self.upsample = SKConvT(last_planes)
-        self.tree = Tree(d_latent, last_planes, in_planes, out_planes, dense_depth, level, block_num, m)
+        self.tree = Tree(d_latent, last_planes, in_planes, out_planes, dense_depth, level, block_num, m, image_size)
         self.upsample_rgb = SKConvT(3)
 
     def forward(self, x: torch.Tensor, w: torch.Tensor, rgb: torch.Tensor):
@@ -563,10 +579,10 @@ class GeneratorStart(nn.Module):
                  block_num: int, m: int):
         super(GeneratorStart, self).__init__()
         self.mapping_network = MappingNetwork(z_dim, mapping_layer)
-        self.convT = EqualizedConvTranspose2D(z_dim, out_planes, kernel_size=4, stride=1, padding=0)
+        self.convT = nn.ConvTranspose2d(z_dim, out_planes, kernel_size=4, stride=1, padding=0)
         self.activation = nn.PReLU(out_planes)
         self.to_rgb = ToRGB(z_dim, out_planes, m)
-        self.tree = Tree(z_dim, out_planes, in_planes, out_planes // 2, dense_depth, level, block_num, m)
+        self.tree = Tree(z_dim, out_planes, in_planes, out_planes // 2, dense_depth, level, block_num, m, 4)
 
     def forward(self, x: torch.Tensor):
         w = self.mapping_network(torch.squeeze(x))
@@ -578,19 +594,19 @@ class GeneratorStart(nn.Module):
 
 
 class Generator(nn.Module):
-    def __init__(self, z_dim, planes=32):
+    def __init__(self, z_dim, planes=56):
         super(Generator, self).__init__()
 
-        self.block0 = GeneratorStart(z_dim, 8, planes * 8, planes * 8, planes // 8, 1,
-                                     1, 1)
-        self.block1 = GeneratorBlock(z_dim, self.block0.get_out_planes(), planes * 4, planes * 4, planes // 8, 1,
-                                     1, 2)  # 8
-        self.block2 = GeneratorBlock(z_dim, self.block1.get_out_planes(), planes * 2, planes * 2, planes // 8, 1,
-                                     1, 2)  # 16
-        self.block3 = GeneratorBlock(z_dim, self.block2.get_out_planes(), planes * 1, planes * 1, planes // 8, 1,
-                                     1, 2)  # 32
-        self.block4 = GeneratorBlock(z_dim, self.block3.get_out_planes(), planes * 1, planes * 1, planes // 8, 1,
-                                     1, 2)  # 64
+        self.block0 = GeneratorStart(z_dim, 8, planes * 8, planes * 8, planes // 8,
+                                     1, 2, 1)
+        self.block1 = GeneratorBlock(z_dim, self.block0.get_out_planes(), planes * 4, planes * 4, planes // 8,
+                                     2, 2, 2, 8)
+        self.block2 = GeneratorBlock(z_dim, self.block1.get_out_planes(), planes * 2, planes * 2, planes // 8,
+                                     2, 2, 2, 16)
+        self.block3 = GeneratorBlock(z_dim, self.block2.get_out_planes(), planes * 1, planes * 1, planes // 8,
+                                     2, 2, 2, 32)
+        self.block4 = GeneratorBlock(z_dim, self.block3.get_out_planes(), planes * 1, planes * 1, planes // 8,
+                                     2, 2, 2, 64)
 
     def forward(self, x: torch.Tensor):
         x, w, rgb = self.block0(x)
