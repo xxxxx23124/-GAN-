@@ -501,19 +501,10 @@ class Tree(nn.Module):
                                    True, False, m, image_size)
 
         self.to_rgb = ToRGB(d_latent, self.get_out_planes(), m)
-
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        self.fc_main = MappingNetwork(3, 4)
-        self.fc_old = nn.Sequential(
-            MappingNetwork(3, 2),
-            EqualizedLinear(3, 3)
-        )
-
-        self.fc_new = nn.Sequential(
-            MappingNetwork(3, 2),
-            EqualizedLinear(3, 3)
-        )
-        self.softmax = nn.Softmax(dim=1)
+        if image_size > 4:
+            self.attention = SKAttention_conv(3, 2)
+        else:
+            self.attention = SKAttention_fc(3, 2)
 
     def forward(self, x: torch.Tensor, w: torch.Tensor, rgb: torch.Tensor):
         d = self.out_planes
@@ -530,25 +521,10 @@ class Tree(nn.Module):
         xs = torch.cat(xs, 1)
         out = self.root(xs, w)
         rgb_new = self.to_rgb(out, w)
-
         rgb.unsqueeze_(dim=1)
         rgb_new.unsqueeze_(dim=1)
         feas = torch.cat([rgb, rgb_new], dim=1)
-
-        b, s, c, _, _ = feas.shape
-        fea_u = torch.sum(feas, dim=1)
-        fea_s = self.gap(fea_u).view(b, c)
-        fea_z = self.fc_main(fea_s)
-
-        fc_old = self.fc_old(fea_z).unsqueeze_(dim=1)
-        fc_new = self.fc_new(fea_z).unsqueeze_(dim=1)
-
-        attention_vectors = torch.cat([fc_old, fc_new], dim=1)
-        attention_vectors = self.softmax(attention_vectors)
-        attention_vectors = attention_vectors.view(b, s, c, 1, 1)
-
-        rgb = (feas * attention_vectors).sum(dim=1)
-
+        rgb = (feas * self.attention(feas)).sum(dim=1)
         return out, rgb
 
 
