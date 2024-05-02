@@ -98,8 +98,6 @@ class Train(trainunits.Units):
                      "fake_loss": f"{fake_loss.item():.4f}", "gp": f"{gp.item():.4f}",
                      "r2_reg_r": f"{r2_reg_r.item():.4f}",
                      "r2_reg_f": f"{r2_reg_f.item():.4f}"})
-                self.scheduler_G.step()
-                self.scheduler_D.step()
                 
                 proc_bar.update(1)
             # self.save_record('WGANGPR2', epoch + 1, 0)
