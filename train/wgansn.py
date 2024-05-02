@@ -57,8 +57,6 @@ class Train(trainunits.Units):
                 proc_bar.set_postfix(
                     {"epoch": f"{epoch}", "Loss_G": f"{g_loss.item():.4f}", "real_loss": f"{real_loss.item():.4f}",
                      "fake_loss": f"{fake_loss.item():.4f}"})
-                self.scheduler_G.step()
-                self.scheduler_D.step()
                 proc_bar.update(1)
             self.save_ckpt('WGANSN', epoch + 1, 0)
             proc_bar.reset()
