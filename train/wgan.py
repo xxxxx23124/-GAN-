@@ -68,6 +68,6 @@ class Train(trainunits.Units):
                     {"epoch": f"{epoch}", "Loss_G": f"{g_loss.item():.4f}", "real_loss": f"{real_loss.item():.4f}",
                      "fake_loss": f"{fake_loss.item():.4f}", "gp": f"{gp.item():.4f}"})
                 proc_bar.update(1)
-            self.save_ckpt('WGANGP', epoch + 1, 0)
+            #self.save_ckpt('WGAN', epoch + 1, 0)
             proc_bar.reset()
         proc_bar.close()
