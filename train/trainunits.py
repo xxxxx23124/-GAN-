@@ -15,10 +15,8 @@ class Units():
         self.fixed_noise = fixed_noise
         self.discriminator = discriminator
         self.discriminator_name = discriminator_name
-        self.optimizer_G = torch.optim.Adam(generator.parameters(), lr=0.0001)
-        self.scheduler_G = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer_G, T_max=epoch_len)
-        self.optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=0.0004)
-        self.scheduler_D = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer_D, T_max=epoch_len)
+        self.optimizer_G = torch.optim.Adam(generator.parameters(), lr=0.0001, betas=(0.5, 0.99))
+        self.optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=0.0004, betas=(0.0, 0.99))
         plt.ion()
         self.show_model()
         self.epoch = 0
@@ -32,6 +30,12 @@ class Units():
             list_pos = self.record.get(name, [])
             list_pos.append(value)
             self.record.update({name: list_pos})
+
+    def write_record_to_txt(self, file_name, record_set):
+        with open(file_name + '.txt', 'a', encoding='utf-8') as file:
+            for name, value in record_set:
+                file.write(name + ' ' + str(value) + ' ')
+            file.write('\n')
 
     def show_model(self):
         print('# generator parameters:', sum(param.numel() for param in self.generator.parameters()))
@@ -125,6 +129,28 @@ class Units():
             checkpoint.clear()
         else:
             print('not find ckpt')
+
+    def draw_plt_record(self, name_png, per_iteration):
+        fig1 = plt.figure(num=name_png, figsize=(16, 9), clear=True)
+        ax = fig1.add_subplot(111)
+        i = 0
+        linestyles = [
+            (0, (3, 3, 1, 2)),
+            (0, (1, 1)),
+            (0, (5, 5)),
+            (0, (5, 3, 1, 2)),
+            (0, (3, 1, 1, 1, 2, 1)),
+            (0, (3, 4, 1, 2, 1, 2)),
+        ]
+        for key in self.record:
+            if (key != 'epoch') and (key != 'i'):
+                ax.plot(self.record[key], label=key, linewidth=1.0, linestyle=linestyles[i])
+                i = i + 1
+
+        ax.legend(fontsize='x-large', loc=1)
+        ax.set_xlabel('every ' + str(per_iteration) + ' iterations')
+        ax.set_ylabel('loss amount')
+        plt.savefig(name_png + '.png', dpi=960)
 
 
 
