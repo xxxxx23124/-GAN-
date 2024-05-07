@@ -429,6 +429,7 @@ class BasicBlock(nn.Module):
 
         if is_unify:
             self.unify = StyleBlock(d_latent, last_planes, in_planes, 2 * out_planes, dense_depth, 3, m, image_size)
+            self.activation_unify = nn.PReLU(2 * out_planes + dense_depth)
             self.rir_3 = ResnetInit(d_latent, out_planes + dense_depth, in_planes, out_planes, dense_depth,
                                     3, m, image_size)
         else:
@@ -437,6 +438,7 @@ class BasicBlock(nn.Module):
 
         if root:
             self.shortcut = StyleBlock(d_latent, last_planes, in_planes, 0, dense_depth, 3, m, image_size)
+            self.activation_shortcut = nn.PReLU(dense_depth)
 
         if image_size > 4:
             self.se_attention_residual = SEBlock_conv(out_planes)
@@ -447,6 +449,7 @@ class BasicBlock(nn.Module):
         d = self.out_planes
         if self.is_unify:
             x = self.unify(x, w)
+            x = self.activation_unify(x)
 
         x_residual = torch.cat([x[:, :d, :, :], x[:, 2 * d:, :, :]], 1)
         x_transient = x[:, d:, :, :]
@@ -457,6 +460,7 @@ class BasicBlock(nn.Module):
 
         if self.root:
             x = self.shortcut(x, w)
+            x = self.activation_shortcut(x)
             out = torch.cat([feas_residual, x_transient_3, x, x_residual_3[:, d:, :, :]], 1)
         else:
             out = torch.cat([feas_residual, x_transient_3, x[:, 2 * d:, :, :], x_residual_3[:, d:, :, :]], 1)
@@ -604,7 +608,7 @@ class GeneratorStart(nn.Module):
 
 
 class Generator(nn.Module):
-    def __init__(self, z_dim, planes=64):
+    def __init__(self, z_dim, planes=48):
         super(Generator, self).__init__()
 
         self.block0 = GeneratorStart(z_dim, 12, planes * 8, planes * 8, planes // 8,
