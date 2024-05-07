@@ -3,4 +3,6 @@
 使用pytorch，torch.__version__ == 2.2.2+cu121， torch.version.cuda == 12.1， torch.backends.cudnn.version() == 8801
 显卡为笔记本2070s 8g显存，G13和D9比较特殊，其余模型均是在此显卡上运行。
 每个生成器模型都有不同的缺陷，生成器随着编号渐渐弥补这些缺陷。
-最终采用13号模型的第五个子版本做为生成器，第9号判别器的第4个版本做为判别器
+最终采用13_5号模型的第五个子版本做为生成器，第9_4号判别器的第4个版本做为判别器
+以下是在https://www.kaggle.com/datasets/spandan2/cats-faces-64x64-for-generative-models数据集上的24个epoch的训练结果
+![24-300](https://github.com/xxxxx23124/-GAN-/assets/137014884/a7de3f9b-6087-4b8d-baa5-6ff98f190be3)
