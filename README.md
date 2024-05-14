@@ -7,3 +7,8 @@
 以下是在https://www.kaggle.com/datasets/spandan2/cats-faces-64x64-for-generative-models
 数据集上的24个epoch的训练结果
 ![24-300](https://github.com/xxxxx23124/-GAN-/assets/137014884/a7de3f9b-6087-4b8d-baa5-6ff98f190be3)
+以下是训练47epoch的视频，每张图间隔200个迭代
+
+
+https://github.com/xxxxx23124/-GAN-/assets/137014884/18e4fb40-80be-41ca-ae1a-8c10368dd895
+
